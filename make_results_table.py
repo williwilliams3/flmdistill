@@ -16,6 +16,7 @@ RUN_ORDER = [
     ("04_kl_teacher_forced", "KL to teacher-forced target"),
     ("05_kl_exact", "KL to exact denoiser"),
     ("06_ce_plus_kl_exact", "CE + exact KL"),
+    ("07_kl_smc", "KL to SMC denoiser"),
 ]
 
 

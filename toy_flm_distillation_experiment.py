@@ -12,6 +12,8 @@ Supported student objectives:
    KL to the exact denoiser induced by the full teacher sequence distribution.
 4. ``ce_kl_exact``:
    mixed objective ``CE + lambda * KL_exact``.
+5. ``kl_smc``:
+   KL to a particle-based SMC approximation of the exact denoiser.
 
 The script evaluates both local denoiser metrics and generation metrics against
 the exact teacher sequence distribution.
@@ -36,6 +38,7 @@ MODE_DISPLAY_NAMES = {
     "kl_teacher_forced": "KL to teacher-forced target",
     "kl_exact": "KL to exact denoiser",
     "ce_kl_exact": "CE + exact-denoiser KL",
+    "kl_smc": "KL to SMC denoiser",
 }
 
 
@@ -58,6 +61,8 @@ class Config:
     seed: int = 0
     mode: str = "ce"
     lambda_kl: float = 1.0
+    smc_particles: int = 64
+    smc_resample_threshold: float = 0.5
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +84,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--log-every", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--smc-particles", type=int, default=64)
+    parser.add_argument("--smc-resample-threshold", type=float, default=0.5)
     parser.add_argument("--run-name", type=str, default="", help="Logical run name used for saved JSON paths.")
     parser.add_argument(
         "--results-root",
@@ -253,6 +260,76 @@ class ExactTeacherFlow:
         return token_flat.view(x_t.size(0), self.seq_len, self.vocab_size)
 
 
+@torch.no_grad()
+def smc_token_posteriors(
+    teacher: SyntheticTeacher,
+    config: Config,
+    x_t: torch.Tensor,
+    t: torch.Tensor,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    batch_size, seq_len, vocab_size = x_t.shape
+    particles = torch.zeros(
+        batch_size,
+        config.smc_particles,
+        seq_len,
+        dtype=torch.long,
+        device=teacher.device,
+    )
+    log_weights = torch.zeros(batch_size, config.smc_particles, device=teacher.device)
+
+    means = t[:, None, None] * teacher.eye[None, :, :]
+    sigma2 = torch.clamp((1.0 - t) ** 2, min=1e-8)
+    diffs = x_t[:, :, None, :] - means[:, None, :, :]
+    log_likelihood = -0.5 * torch.sum(diffs * diffs, dim=-1) / sigma2[:, None, None]
+
+    for pos in range(seq_len):
+        if pos == 0:
+            prior = teacher.start_probs.expand(batch_size * config.smc_particles, -1)
+        else:
+            prefixes = particles[:, :, :pos].reshape(batch_size * config.smc_particles, pos)
+            prior = teacher.next_probs_from_prefix(prefixes, pos)
+
+        prior = torch.clamp(prior, min=1e-12).view(batch_size, config.smc_particles, vocab_size)
+        proposal_logits = torch.log(prior) + log_likelihood[:, pos, None, :]
+        proposal_probs = torch.softmax(proposal_logits, dim=-1)
+
+        sampled = torch.multinomial(
+            proposal_probs.reshape(batch_size * config.smc_particles, vocab_size),
+            num_samples=1,
+            generator=generator,
+        ).view(batch_size, config.smc_particles)
+        particles[:, :, pos] = sampled
+
+        log_weights = log_weights + torch.logsumexp(proposal_logits, dim=-1)
+        if pos == seq_len - 1:
+            continue
+
+        normalized = torch.softmax(log_weights, dim=-1)
+        ess = 1.0 / torch.sum(normalized * normalized, dim=-1)
+        resample_rows = torch.where(ess < config.smc_resample_threshold * config.smc_particles)[0]
+        if resample_rows.numel() == 0:
+            continue
+
+        ancestor_idx = torch.multinomial(
+            normalized[resample_rows],
+            num_samples=config.smc_particles,
+            replacement=True,
+            generator=generator,
+        )
+        gathered_particles = torch.gather(
+            particles[resample_rows],
+            dim=1,
+            index=ancestor_idx[:, :, None].expand(-1, -1, seq_len),
+        )
+        particles[resample_rows] = gathered_particles
+        log_weights[resample_rows] = 0.0
+
+    normalized = torch.softmax(log_weights, dim=-1)
+    particle_onehots = F.one_hot(particles, num_classes=vocab_size).float()
+    return torch.sum(normalized[:, :, None, None] * particle_onehots, dim=1)
+
+
 def sample_noised_batch(
     teacher: SyntheticTeacher,
     config: Config,
@@ -419,6 +496,7 @@ def generate_from_student(
 
 def compute_training_loss(
     mode: str,
+    config: Config,
     logits: torch.Tensor,
     probs: torch.Tensor,
     sequences: torch.Tensor,
@@ -427,6 +505,7 @@ def compute_training_loss(
     teacher: SyntheticTeacher,
     exact_flow: ExactTeacherFlow,
     lambda_kl: float,
+    generator: torch.Generator,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     diagnostics: dict[str, float] = {}
     ce_loss = F.cross_entropy(logits.reshape(-1, teacher.vocab_size), sequences.reshape(-1))
@@ -446,6 +525,13 @@ def compute_training_loss(
             exact_targets = exact_flow.token_posteriors(x_t, t)
         exact_kl_loss = distillation_kl(probs, exact_targets)
         diagnostics["exact_kl_loss"] = float(exact_kl_loss.item())
+
+    if mode == "kl_smc":
+        with torch.no_grad():
+            smc_targets = smc_token_posteriors(teacher, config, x_t, t, generator)
+        smc_kl_loss = distillation_kl(probs, smc_targets)
+        diagnostics["smc_kl_loss"] = float(smc_kl_loss.item())
+        return smc_kl_loss, diagnostics
 
     if mode == "ce":
         return ce_loss, diagnostics
@@ -478,6 +564,7 @@ def train_student(
         probs = torch.softmax(logits, dim=-1)
         loss, loss_parts = compute_training_loss(
             config.mode,
+            config,
             logits,
             probs,
             sequences,
@@ -486,6 +573,7 @@ def train_student(
             teacher,
             exact_flow,
             config.lambda_kl,
+            generator,
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -525,6 +613,8 @@ def main() -> None:
         seed=args.seed,
         mode=args.mode,
         lambda_kl=args.lambda_kl,
+        smc_particles=args.smc_particles,
+        smc_resample_threshold=args.smc_resample_threshold,
     )
     output_path = resolve_output_path(args)
     torch.manual_seed(config.seed)
