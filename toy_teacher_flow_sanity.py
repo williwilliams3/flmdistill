@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Sanity check for exact flow generation induced by an AR teacher.
+"""Sanity check for flow generation induced by an AR teacher.
 
 This script uses the same synthetic autoregressive teacher as
 `toy_flm_distillation_experiment.py`, but does not train a student model.
@@ -9,10 +9,11 @@ Instead, it:
 1. Enumerates the exact teacher sequence distribution.
 2. Builds the exact Gaussian-mixture denoiser and vector field induced by that
    discrete sequence distribution.
-3. Generates sequences in two ways:
+3. Generates sequences in three ways:
    - direct autoregressive sampling from the teacher,
    - solving the exact probability-flow ODE and decoding at the end.
-4. Compares both samplers against the exact teacher distribution.
+   - solving the probability-flow ODE using an SMC-estimated denoiser.
+4. Compares the samplers against the exact teacher distribution.
 
 The purpose is a sanity check: if the Gaussian-mixture flow implementation is
 correct, then its generation metrics should be close to the AR baseline.
@@ -29,7 +30,12 @@ from pathlib import Path
 
 import torch
 
-from toy_flm_distillation_experiment import SyntheticTeacher, get_device
+from toy_flm_distillation_experiment import (
+    SyntheticTeacher,
+    get_device,
+    smc_particles_and_weights,
+    smc_token_posteriors,
+)
 
 
 @dataclass
@@ -44,6 +50,8 @@ class Config:
     integrator: str = "rk4"
     decode: str = "joint"
     sampler: str = "both"
+    smc_particles: int = 64
+    smc_resample_threshold: float = 0.5
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +64,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--integrator", type=str, choices=["euler", "rk4"], default="rk4")
     parser.add_argument("--decode", type=str, choices=["joint", "token", "argmax"], default="joint")
-    parser.add_argument("--sampler", type=str, choices=["ar", "flow", "both"], default="both")
+    parser.add_argument("--sampler", type=str, choices=["ar", "flow", "smc_flow", "both"], default="both")
+    parser.add_argument("--smc-particles", type=int, default=64)
+    parser.add_argument("--smc-resample-threshold", type=float, default=0.5)
     parser.add_argument("--run-name", type=str, default="")
     parser.add_argument("--results-root", type=str, default="")
     parser.add_argument("--save-json", type=str, default="")
@@ -71,6 +81,7 @@ def resolve_output_path(args: argparse.Namespace) -> Path | None:
     run_name = args.run_name or {
         "ar": "01_true_ar",
         "flow": "02_true_ode",
+        "smc_flow": "03_smc_ode",
         "both": "00_true_both",
     }[args.sampler]
     return Path(args.results_root) / run_name / f"result_seed{args.seed}.json"
@@ -159,8 +170,46 @@ class ExactTeacherFlow:
         return token_probs.argmax(dim=-1)
 
 
+class SmcTeacherFlow:
+    """SMC approximation to the AR-induced Gaussian-mixture flow."""
+
+    def __init__(self, teacher: SyntheticTeacher, config: Config, generator: torch.Generator) -> None:
+        self.teacher = teacher
+        self.config = config
+        self.seq_len = config.seq_len
+        self.vocab_size = config.vocab_size
+        self.generator = generator
+
+    @torch.no_grad()
+    def token_posteriors(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return smc_token_posteriors(self.teacher, self.config, x_t, t, self.generator)
+
+    @torch.no_grad()
+    def velocity(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        denoiser = self.token_posteriors(x_t, t)
+        scale = torch.clamp((1.0 - t)[:, None, None], min=1e-4)
+        return (denoiser - x_t) / scale
+
+    @torch.no_grad()
+    def decode(self, x_t: torch.Tensor, t: torch.Tensor, generator: torch.Generator, mode: str) -> torch.Tensor:
+        particles, weights = smc_particles_and_weights(self.teacher, self.config, x_t, t, generator)
+        if mode == "joint":
+            indices = torch.multinomial(weights, num_samples=1, generator=generator).squeeze(-1)
+            return particles[torch.arange(x_t.size(0), device=x_t.device), indices]
+
+        particle_onehots = torch.nn.functional.one_hot(particles, num_classes=self.vocab_size).float()
+        token_probs = torch.sum(weights[:, :, None, None] * particle_onehots, dim=1)
+        if mode == "token":
+            tokens = torch.multinomial(
+                token_probs.reshape(-1, self.vocab_size), num_samples=1, generator=generator
+            )
+            return tokens.view(x_t.size(0), self.seq_len)
+
+        return token_probs.argmax(dim=-1)
+
+
 @torch.no_grad()
-def rk4_step(flow: ExactTeacherFlow, x: torch.Tensor, t_value: float, dt: float) -> torch.Tensor:
+def rk4_step(flow, x: torch.Tensor, t_value: float, dt: float) -> torch.Tensor:
     batch_size = x.size(0)
     device = x.device
 
@@ -179,7 +228,7 @@ def rk4_step(flow: ExactTeacherFlow, x: torch.Tensor, t_value: float, dt: float)
 
 @torch.no_grad()
 def sample_sequences_via_flow(
-    flow: ExactTeacherFlow,
+    flow,
     config: Config,
     num_sequences: int,
     generator: torch.Generator,
@@ -287,6 +336,8 @@ def main() -> None:
         integrator=args.integrator,
         decode=args.decode,
         sampler=args.sampler,
+        smc_particles=args.smc_particles,
+        smc_resample_threshold=args.smc_resample_threshold,
     )
     output_path = resolve_output_path(args)
 
@@ -305,10 +356,14 @@ def main() -> None:
     start_time = time.time()
     ar_samples = None
     flow_samples = None
+    smc_flow_samples = None
     if config.sampler in {"ar", "both"}:
         ar_samples = teacher.sample_sequences(config.eval_sequences, config.seq_len, generator)
     if config.sampler in {"flow", "both"}:
         flow_samples = sample_sequences_via_flow(flow, config, config.eval_sequences, generator)
+    if config.sampler == "smc_flow":
+        smc_flow = SmcTeacherFlow(teacher, config, generator)
+        smc_flow_samples = sample_sequences_via_flow(smc_flow, config, config.eval_sequences, generator)
     duration = time.time() - start_time
 
     teacher_entropy_per_token = flow.exact_entropy / config.seq_len
@@ -322,6 +377,7 @@ def main() -> None:
     print("-------------------------------------------")
     ar_metrics = None
     flow_metrics = None
+    smc_flow_metrics = None
     pairwise_tv = None
 
     if ar_samples is not None:
@@ -335,6 +391,13 @@ def main() -> None:
         flow_metrics = summarize_samples(
             "Flow ODE",
             flow_samples,
+            flow.exact_distribution,
+            flow.exact_token_marginals,
+        )
+    if smc_flow_samples is not None:
+        smc_flow_metrics = summarize_samples(
+            "SMC ODE",
+            smc_flow_samples,
             flow.exact_distribution,
             flow.exact_token_marginals,
         )
@@ -354,6 +417,9 @@ def main() -> None:
     elif config.sampler == "flow":
         summary_metrics = flow_metrics
         display_name = "True ODE sampling"
+    elif config.sampler == "smc_flow":
+        summary_metrics = smc_flow_metrics
+        display_name = "SMC-denoiser ODE sampling"
     else:
         summary_metrics = {
             "ar_sequence_tv_to_teacher": ar_metrics["sequence_tv_to_teacher"] if ar_metrics is not None else None,
@@ -372,6 +438,7 @@ def main() -> None:
         "teacher_entropy_per_token": teacher_entropy_per_token,
         "ar_metrics": ar_metrics,
         "flow_metrics": flow_metrics,
+        "smc_flow_metrics": smc_flow_metrics,
         "ar_vs_flow_empirical_tv": pairwise_tv,
         "summary_metrics": summary_metrics,
         "duration_sec": duration,

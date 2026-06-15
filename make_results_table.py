@@ -12,6 +12,7 @@ from pathlib import Path
 RUN_ORDER = [
     ("01_true_ar", "True AR sampling"),
     ("02_true_ode", "True ODE sampling"),
+    ("03_smc_ode", "SMC-denoiser ODE sampling"),
     ("03_ce_only", "CE only"),
     ("05_kl_exact", "KL to exact denoiser"),
     ("06_ce_plus_kl_exact", "CE + exact KL"),

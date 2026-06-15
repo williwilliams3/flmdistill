@@ -241,13 +241,13 @@ class ExactTeacherFlow:
 
 
 @torch.no_grad()
-def smc_token_posteriors(
+def smc_particles_and_weights(
     teacher: SyntheticTeacher,
     config: Config,
     x_t: torch.Tensor,
     t: torch.Tensor,
     generator: torch.Generator,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size, seq_len, vocab_size = x_t.shape
     particles = torch.zeros(
         batch_size,
@@ -306,7 +306,19 @@ def smc_token_posteriors(
         log_weights[resample_rows] = 0.0
 
     normalized = torch.softmax(log_weights, dim=-1)
-    particle_onehots = F.one_hot(particles, num_classes=vocab_size).float()
+    return particles, normalized
+
+
+@torch.no_grad()
+def smc_token_posteriors(
+    teacher: SyntheticTeacher,
+    config: Config,
+    x_t: torch.Tensor,
+    t: torch.Tensor,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    particles, normalized = smc_particles_and_weights(teacher, config, x_t, t, generator)
+    particle_onehots = F.one_hot(particles, num_classes=teacher.vocab_size).float()
     return torch.sum(normalized[:, :, None, None] * particle_onehots, dim=1)
 
 
