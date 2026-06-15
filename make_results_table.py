@@ -17,6 +17,8 @@ RUN_ORDER = [
     ("05_kl_exact", "KL to exact denoiser"),
     ("06_ce_plus_kl_exact", "CE + exact KL"),
     ("07_kl_smc", "KL to SMC denoiser"),
+    ("08_flowmap_exact", "Flow Map direct (exact denoiser)"),
+    ("09_flowmap_smc", "Flow Map direct (SMC denoiser)"),
 ]
 
 
@@ -54,7 +56,7 @@ def build_table(rows: list[tuple[str, dict | None]]) -> str:
         r"\resizebox{\textwidth}{!}{%",
         r"\begin{tabular}{lcccccc}",
         r"\toprule",
-        r"Method & Hard CE & Exact KL & Token Acc & Seq CE & Seq KL & Seq TV \\",
+        r"Method & Denoiser CE & Denoiser KL & Denoiser Acc & Sample NLL & Sample KL & Sample TV \\",
         r"\midrule",
     ]
 

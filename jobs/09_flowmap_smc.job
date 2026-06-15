@@ -1,0 +1,48 @@
+#!/bin/bash
+#SBATCH --job-name=toy-flm-09-flowmap-smc
+#SBATCH --account=project_462001000
+#SBATCH --partition=small-g
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=7
+#SBATCH --gpus-per-task=1
+#SBATCH --time=08:00:00
+#SBATCH --output=logs/09_flowmap_smc/%x-%j.out
+
+set -euo pipefail
+
+stamp() {
+    date "+[%Y-%m-%d %H:%M:%S] $*"
+}
+
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    ROOT_DIR="$SLURM_SUBMIT_DIR"
+else
+    JOB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    ROOT_DIR="$(cd "$JOB_DIR/.." && pwd)"
+fi
+RESULT_DIR="$ROOT_DIR/results/toy_distillation/09_flowmap_smc"
+
+module use /appl/local/laifs/modules
+module load lumi-aif-singularity-bindings
+
+SIF=/appl/local/laifs/containers/lumi-multitorch-u24r64f21m43t29-20260124_092648/lumi-multitorch-full-u24r64f21m43t29-20260124_092648.sif
+
+export PYTHONUNBUFFERED=1
+mkdir -p "$RESULT_DIR"
+cd "$ROOT_DIR"
+
+stamp "running on node $(hostname)"
+stamp "starting direct Flow Map training with SMC denoiser anchor"
+
+srun --unbuffered singularity exec "$SIF" python -u "$ROOT_DIR/toy_flow_map_distillation_experiment.py" \
+    --device cuda \
+    --diagonal-target smc \
+    --smc-particles 64 \
+    --smc-resample-threshold 0.5 \
+    --train-steps 3000 \
+    --batch-size 1024 \
+    --eval-batch-size 1024 \
+    --eval-sequences 8192 \
+    --ode-steps 8 \
+    --save-json "$RESULT_DIR/result_${SLURM_JOB_ID}.json"
