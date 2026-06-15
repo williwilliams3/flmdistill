@@ -6,13 +6,11 @@ Supported student objectives:
 
 1. ``ce``:
    standard cross-entropy on clean sampled tokens.
-2. ``kl_teacher_forced``:
-   KL to the current teacher-forced local posterior target.
-3. ``kl_exact``:
+2. ``kl_exact``:
    KL to the exact denoiser induced by the full teacher sequence distribution.
-4. ``ce_kl_exact``:
+3. ``ce_kl_exact``:
    mixed objective ``CE + lambda * KL_exact``.
-5. ``kl_smc``:
+4. ``kl_smc``:
    KL to a particle-based SMC approximation of the exact denoiser.
 
 The script evaluates both local denoiser metrics and generation metrics against
@@ -35,7 +33,6 @@ import torch.nn.functional as F
 
 MODE_DISPLAY_NAMES = {
     "ce": "CE only",
-    "kl_teacher_forced": "KL to teacher-forced target",
     "kl_exact": "KL to exact denoiser",
     "ce_kl_exact": "CE + exact-denoiser KL",
     "kl_smc": "KL to SMC denoiser",
@@ -203,23 +200,6 @@ class SyntheticTeacher:
                 prob *= float(probs[seq[pos]].item())
             distribution[tuple(seq)] = prob
         return distribution
-
-    def posterior_targets(self, sequences: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, _ = x_t.shape
-        means = t[:, None, None] * self.eye[None, :, :]
-        sigma2 = torch.clamp((1.0 - t) ** 2, min=1e-8)
-        targets = []
-
-        for pos in range(seq_len):
-            prior = self.next_probs_from_prefix(sequences, pos)
-            x_pos = x_t[:, pos, :]
-            diffs = x_pos[:, None, :] - means
-            sq_norm = torch.sum(diffs * diffs, dim=-1)
-            log_weights = torch.log(torch.clamp(prior, min=1e-12)) - 0.5 * sq_norm / sigma2[:, None]
-            targets.append(torch.softmax(log_weights, dim=-1))
-
-        return torch.stack(targets, dim=1)
-
 
 class ExactTeacherFlow:
     """Exact Gaussian-mixture teacher induced by the full AR sequence law."""
@@ -431,29 +411,23 @@ def evaluate_model(
     generator: torch.Generator,
 ) -> dict[str, float]:
     sequences, _, _, x_t, t = sample_noised_batch(teacher, config, config.eval_batch_size, generator)
-    teacher_forced_targets = teacher.posterior_targets(sequences, x_t, t)
     exact_targets = exact_flow.token_posteriors(x_t, t)
     probs = model.probs(x_t, t)
     logits = model.forward(x_t, t)
 
     hard_ce = F.cross_entropy(logits.reshape(-1, config.vocab_size), sequences.reshape(-1)).item()
-    teacher_forced_kl = distillation_kl(probs, teacher_forced_targets).item()
     exact_kl = distillation_kl(probs, exact_targets).item()
     token_acc = (probs.argmax(dim=-1) == sequences).float().mean().item()
 
     scale = torch.clamp((1.0 - t)[:, None, None], min=1e-4)
-    teacher_forced_velocity = (teacher_forced_targets - x_t) / scale
     exact_velocity = (exact_targets - x_t) / scale
     student_velocity = (probs - x_t) / scale
 
-    teacher_forced_velocity_mse = torch.mean((teacher_forced_velocity - student_velocity) ** 2).item()
     exact_velocity_mse = torch.mean((exact_velocity - student_velocity) ** 2).item()
     return {
         "hard_ce": hard_ce,
-        "teacher_forced_kl": teacher_forced_kl,
         "exact_kl": exact_kl,
         "token_acc": token_acc,
-        "teacher_forced_velocity_mse": teacher_forced_velocity_mse,
         "exact_velocity_mse": exact_velocity_mse,
     }
 
@@ -511,15 +485,7 @@ def compute_training_loss(
     ce_loss = F.cross_entropy(logits.reshape(-1, teacher.vocab_size), sequences.reshape(-1))
     diagnostics["ce_loss"] = float(ce_loss.item())
 
-    tf_kl_loss: torch.Tensor | None = None
     exact_kl_loss: torch.Tensor | None = None
-    if mode == "kl_teacher_forced":
-        with torch.no_grad():
-            teacher_forced_targets = teacher.posterior_targets(sequences, x_t, t)
-        tf_kl_loss = distillation_kl(probs, teacher_forced_targets)
-        diagnostics["teacher_forced_kl_loss"] = float(tf_kl_loss.item())
-        return tf_kl_loss, diagnostics
-
     if mode in {"kl_exact", "ce_kl_exact"}:
         with torch.no_grad():
             exact_targets = exact_flow.token_posteriors(x_t, t)
@@ -590,7 +556,6 @@ def train_student(
                 f"[{config.mode:17s}] step={step:4d} "
                 f"train_loss={loss.item():.4f} "
                 f"hard_ce={metrics['hard_ce']:.4f} "
-                f"tf_kl={metrics['teacher_forced_kl']:.4f} "
                 f"exact_kl={metrics['exact_kl']:.4f} "
                 f"token_acc={metrics['token_acc']:.4f} "
                 f"exact_vel_mse={metrics['exact_velocity_mse']:.4f}"
@@ -666,7 +631,6 @@ def main() -> None:
     print(
         f"{MODE_DISPLAY_NAMES[config.mode]}: "
         f"hard_ce={local_metrics['hard_ce']:.4f}, "
-        f"tf_kl={local_metrics['teacher_forced_kl']:.4f}, "
         f"exact_kl={local_metrics['exact_kl']:.4f}, "
         f"token_acc={local_metrics['token_acc']:.4f}, "
         f"exact_vel_mse={local_metrics['exact_velocity_mse']:.4f}, "

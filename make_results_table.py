@@ -13,7 +13,6 @@ RUN_ORDER = [
     ("01_true_ar", "True AR sampling"),
     ("02_true_ode", "True ODE sampling"),
     ("03_ce_only", "CE only"),
-    ("04_kl_teacher_forced", "KL to teacher-forced target"),
     ("05_kl_exact", "KL to exact denoiser"),
     ("06_ce_plus_kl_exact", "CE + exact KL"),
     ("07_kl_smc", "KL to SMC denoiser"),
@@ -52,9 +51,9 @@ def build_table(rows: list[tuple[str, dict | None]]) -> str:
         r"\centering",
         r"\small",
         r"\resizebox{\textwidth}{!}{%",
-        r"\begin{tabular}{lcccccccc}",
+        r"\begin{tabular}{lcccccc}",
         r"\toprule",
-        r"Method & Hard CE & TF KL & Exact KL & Token Acc & Exact Vel MSE & Seq CE & Seq KL & Seq TV \\",
+        r"Method & Hard CE & Exact KL & Token Acc & Seq CE & Seq KL & Seq TV \\",
         r"\midrule",
     ]
 
@@ -65,10 +64,8 @@ def build_table(rows: list[tuple[str, dict | None]]) -> str:
                 [
                     label,
                     format_metric(summary, "hard_ce"),
-                    format_metric(summary, "teacher_forced_kl"),
                     format_metric(summary, "exact_kl"),
                     format_metric(summary, "token_acc"),
-                    format_metric(summary, "exact_velocity_mse"),
                     format_metric(summary, "sequence_cross_entropy"),
                     format_metric(summary, "sequence_kl_emp_to_teacher"),
                     format_metric(summary, "sequence_tv_to_teacher"),
